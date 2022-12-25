@@ -1,0 +1,495 @@
+---
+title: "projekt2"
+author: "Julia Gołębiowska"
+date: "26/05/2022"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+#setwd("~/Dokumenty/VIrok/SAD/projekt2")
+#install.packages('R.utils')
+#install.packages('caret')
+#install.packages('glmnet')
+#install.packages('MDplot')
+#install.packages('ranger')
+#install.packages("stringr")
+#install.packages('pls')
+```
+
+## 1. Eksploracja
+
+
+```{r}
+#read
+library(data.table)
+x_train = as.data.frame(fread("X_train.csv.gz"))
+x_test = as.data.frame(fread("X_test.csv.gz"))
+y_train = as.data.frame(fread("y_train.csv.gz"))
+```
+
+Dane mają 9000 zmiennych. Są 3794 obserwacje w zbiorze treningowym i 670 obserwacji w zbiorze treningowym. 
+```{r}
+head(x_train)
+head(y_train)
+sum(is.na(x_train)) #check comletness
+sum(is.na(x_test)) #check comletness
+
+```
+Dane są kompletne 
+```{r}
+mean_y = mean(y_train$CD36)
+median_y = median(y_train$CD36)
+variance_y = var(y_train$CD36)
+hist(y_train$CD36)
+```
+
+Zbiór obserwacji zmiennej objaśnianej ma średnią: `r mean_y`, medianę: `r median_y` i wariancje:  `r variance_y`. Histogram zmiennej objaśnianej wskazuje, że gdyby w danych nie było tak dużo wartości 0, to rozkład tej zmiennej byłby zbliżony do normalnego.
+Poniżej  możemy zobaczyć heatmapę korelacji dla 250 najbardziej skorelowanych zmiennych ze zmienną objaśnianą.  Możemy zauważyć, że istnieją grupy zmiennych bardzo ze sobą skorelowanych. 
+```{r}
+#choose 250 the most correlated with y_train 
+corr <- apply(x_train[,1:9000], 2, cor, y_train$CD36)
+#calculate correlation between chosen variables
+order_corr <- unlist(order(corr, decreasing=TRUE))[1:250]
+p.corr <- cor(x_train[,order_corr])
+heatmap(p.corr, scale = "none")
+```
+
+## 2. Elastic Net
+
+Elastic Net - to metoda regresji linniowej, która dobiera parametry modelu linniowego ($\beta$), poprzez minimalizacje wyrażenia (*) 
+
+$RSS = \sum_{x = i}^{n} ( y_{i} - (\beta_{0} + \sum_{x = j}^{p}(\beta_{j}x_{ij})))^2$
+
+(*) $RSS + \lambda_{1} \sum_{x = j}^{p} |\beta_{j}| + \lambda_{2} \sum_{x = j}^{p} \beta_{j}^2$
+
+Możemy zauważyć, że model ten łączy metody regularyzacji regresji lasso i ridge. Hiperparametrami w tej metodzie są $\lambda_{1}$ i $\lambda_{2}$ nazywane  parametrami sterującym (ang. tuning parameter). W szczególnym przypadku gdy $\lambda_{1} = 0$ otrzymujemy wyrażenie minimalizowane w eotodzie rigde, a gdy  $\lambda_{2} = 0$ to otrzymujemy z koleji wyrażenie minimalizowane w metodzie lasso. 
+Metoda Elastic Net łączy zalety metod lasso i ridge. Dla niektórych skorelowanych zmiennych może przypoządkować wspólczynniki modelu do zera lub też je zrównać do zera. Pozwala to na kompromis między modelem bardzo prostym a skomplikowanym, szczególnie dla dużych danych i trudno intrepretowalnych z dużą korelacją niektórych zmiennych (takich jak w tym zadaniu).
+(żródla: https://www.youtube.com/watch?v=1dKRdX9bfIo, https://en.wikipedia.org/wiki/Elastic_net_regularization)
+
+Ponieważ dane są duże to zdecydowałam się na liczbę podzbiorów walidacji krzyżowej równej 5. Taki podział pozwala na dość szybką estymacje parametrów, a jednocześnie zachowawanie dużego zbioru treningowego (80% wszystkich danych).
+```{r}
+x = 5
+split <- cut(1:nrow(x_train), x, labels = F)
+split <- sample(split)
+
+library(glmnet)
+library(MDplot)
+
+list_folds_test=list()
+list_folds_train=list()
+for (i in 1:x) {
+  train <- which(split != i) 
+  alpha =c(0, 0.1, 0.5, 0.75, 1)
+  lambda= c(0.001, 0.01, 0.1, 1)
+  matrix_parametrs_test <-matrix(0,length(alpha),length(lambda), dimnames = list(alpha,lambda)) 
+  matrix_parametrs_train <-matrix(0,length(alpha),length(lambda), dimnames = list(alpha,lambda)) 
+    for (a in  1:length(alpha)){
+    for (l in 1:length(lambda)){
+  model <- glmnet(x=x_train[train,,drop=TRUE],  y=y_train[train,], alpha = alpha[a], lambda = lambda[l]) 
+  prediction <- predict(model, newx=as.matrix(x_train), 'response') 
+  prediction_train <- prediction[train]  
+  prediction_test <- prediction[-train]
+#count RMSD and store result in matrix
+  matrix_parametrs_train[a,l]<-sqrt(sum((prediction_train - y_train$CD36[train])^2)/length(train))
+  matrix_parametrs_test[a,l]<- sqrt(sum((prediction_test - y_train$CD36[-train])^2)/(nrow(y_train)-length(train)))
+           }   }
+list_folds_test[[i]] <- matrix_parametrs_test
+list_folds_train[[i]]<- matrix_parametrs_train
+}
+
+```
+W celu porówania wyników uśredniamy je dla każdego zbioru wykorzystanego podczas walidacji krzyżowej.
+```{r}
+#count mean 
+matrix_parametrs_test_mean <- Reduce("+", list_folds_test)/x
+matrix_parametrs_train_mean <- Reduce("+", list_folds_train)/x
+matrix_parametrs_test_mean
+matrix_parametrs_train_mean
+#save errors for plot
+chosen_alpha <- as.character(0.1) 
+chosen_lambda <- as.character(0.1) 
+err.kfold <- c()
+err.train <- c()
+for (i in 1:x){
+  #add to vector
+  err.kfold <- append(err.kfold, list_folds_test[[i]][chosen_alpha, chosen_lambda])
+  err.train <- append(err.train, list_folds_train[[i]][chosen_alpha, chosen_lambda])
+  }
+```
+Jako parę hiperparametrów wybieram alpha = `r chosen_alpha` i lambda = `r chosen_lambda`, które dały najlepsze wyniki na zbiorze testowym. 
+```{r}
+library(ggplot2)
+dane_do_wykresu <- data.frame('Fold' = as.integer(rep(1:x, 2)),
+                              'Blad' = c(err.kfold, err.train),
+                              'Typ' = rep(c('Testowy', 'Treningowy'), each=x))
+ggplot(dane_do_wykresu,
+       aes(x=Fold, y=Blad, color=Typ)) + 
+  ggtitle('Porównanie błędu treningowego i testowego', 
+          subtitle = paste0('Średni błąd testowy = ', round(matrix_parametrs_test_mean[chosen_alpha, chosen_lambda], 3), ' treningowy = ', round(matrix_parametrs_train_mean[chosen_alpha, chosen_lambda], 3))) + 
+  geom_line() + geom_point() + scale_x_continuous(breaks = seq(1,x,by=2)) +  theme_minimal() 
+```
+
+Tak jak widać na załączonym wykresie błąd testowy wynosi `r round(matrix_parametrs_test_mean[chosen_alpha, chosen_lambda], 3)`, a treningowy `r  round(matrix_parametrs_train_mean[chosen_alpha, chosen_lambda], 3)`.
+
+#3. Random forest
+Poniżej porównamy działanie modelu random forest dla zadanej siatki parametrów i porówanymy jego działanie z modelem elastic net.
+
+```{r}
+library("ranger")
+#function for testing hiperparameters
+  train_and_test_random_forest <- function(x_train, y_train, train_set, param_vec){
+  #parse vector of parameters
+  num.trees = param_vec[1]
+  max.depth = param_vec[2]
+  alpha = param_vec[3]
+  model <- ranger(x=x_train[train_set,,drop=TRUE],  y=y_train[train_set,], alpha = alpha, num.trees = num.trees, max.depth = max.depth)
+  prediction <- predict(model, data=x_train)  # robimy predykcje na całych danych
+  prediction_train <- prediction$predictions[train_set]  # wybieramy predykcje odpowiadające zbiorowi train_setmu
+  prediction_test <- prediction$predictions[-train_set]
+  #count RMSD and store result in matrix
+  train_error <- sqrt(sum((prediction_train - y_train$CD36[train_set])^2)/length(train_set))
+  test_error <- sqrt(sum((prediction_test - y_train$CD36[-train_set])^2)/(nrow(y_train)-length(train_set)))
+  return(c(train_error, test_error))}
+
+```
+ 
+```{r}
+#prepare grid of parameters
+num.trees = c(5, 10, 50)
+max.depth = c(10, 100, 500)
+alpha = c(0.01, 0.1, 0.5)
+grid<- as.matrix(expand.grid(num.trees, max.depth, alpha))
+colnames(grid) <- c("num.trees", "max.depths", "alpha")
+#here we will be deposing results from different folds
+list_folds=list()
+#test
+for (i in 1:x) {
+  train <- which(split != i)  #vector with indexes form train; the same as in elastic net task
+  #here we are using parameters from grid
+  result <- apply(grid, 1, train_and_test_random_forest, x_train = x_train, y_train=y_train, train_set = train)
+  #reformat and save results
+  result <- t(result)
+  colnames(result)<- c("train_err", "test_err" )
+  list_folds[[i]] <- cbind(grid, result)
+  }
+```
+Poza modelami elastic net i random forest chcemy dołaczyć do ostatecznego porównania model referencyjny, który dla dowolnych zmiennych objaśniających przyporządkowuje średnią z zmiennej objaśnianej.  
+```{r}
+#count reference model
+ref_train_err_vec <- c() 
+ref_test_err_vec <-  c()
+ref_fold_vec <- c()
+for (i in 1:x) {
+  train <- which(split != i)  #vector with indexes form train; the same as in elastic net task
+  #count reference model
+  mean_y_pred_train = rep(c(mean(y_train[train,])), each = length(train))
+  mean_y_pred_test = rep(c(mean(y_train[train,])), each = length(y_train[-train,1]))
+  #count errors
+  ref_train_error <- sqrt(sum((mean_y_pred_train - y_train$CD36[train])^2)/length(train))
+  ref_test_error <- sqrt(sum((mean_y_pred_test - y_train$CD36[-train])^2)/(nrow(y_train)-length(train)))
+  #return(c(train_error, test_error))
+  ref_train_err_vec <- append(ref_train_err_vec, ref_train_error)
+  ref_test_err_vec <- append(ref_test_err_vec, ref_test_error)
+  ref_fold_vec <- append(ref_fold_vec, i)
+}
+#count average
+  ref_train_err_vec <- append(ref_train_err_vec, mean(ref_train_err_vec))
+  ref_test_err_vec <- append(ref_test_err_vec, mean(ref_test_err_vec))
+  ref_fold_vec <- c(ref_fold_vec, "average")
+
+```
+ 
+Aby porówanać modele musimy przygotować porówananie tabelaryczne, gdzie znajdą się wyniki dla poszczególnych podziałów (foldów) oraz wyniki uśrednione.
+```{r}
+#prepare table of comparison of different methods -
+#results of random forest
+param_string <- function(x, names){
+  vec <-c()
+  for (i in 1:length(names)){
+  vec <- append(vec, names[[i]])
+  vec <- append(vec, x[i])
+  }
+  res<-toString(vec)
+  res
+  }
+
+parameters <- c()
+method <- c()
+fold <- c()
+train_err <- c()
+test_err <- c()
+#random forest
+for (i in 1:x){
+  df_rf <- list_folds[[i]][,1:3]
+  names <- as.vector(colnames(df_rf))
+  param_vec <-apply(df_rf, 1, param_string, names)
+  method_vec = rep(c("random_forest"), each = length(grid[,1]))
+  fold_vec = rep (c(i), each = length(grid[,1]))
+  train_err_vec <- list_folds[[i]][,"train_err"]
+  test_err_vec <- list_folds[[i]][,"test_err"]
+  parameters <- append(parameters, param_vec)
+  method <- append(method, method_vec)
+  fold <- append(fold, fold_vec)
+  train_err <- append(train_err, train_err_vec)
+  test_err <-  append(test_err, test_err_vec)
+}
+
+#add average results to table 
+#calculate average values
+mean_folds <- Reduce("+", list_folds)/x
+names <- as.vector(colnames(mean_folds[,1:3]))
+param_vec <-apply(mean_folds[,1:3], 1, param_string, names)
+train_err <- append(train_err, mean_folds[,"train_err"])
+test_err <- append(test_err, mean_folds[,"test_err"])
+parameters <- append(parameters, param_vec)
+fold_vec = rep (c("average"), each = length(grid[,1]))
+fold <- append(fold, fold_vec)
+method_vec = rep(c("random_forest"), each = length(grid[,1]))
+method <- append(method, method_vec)
+
+```
+```{r}
+#add results from elastic net to table
+alpha = c(0, 0.1, 0.5, 0.75)
+lambda = c(0.001, 0.01, 0.1, 1)
+
+for (i in 1:x){
+  method_vec = rep(c("elastic_net"), each = length(alpha)*length(lambda))
+  method <- append(method, method_vec)
+  
+  
+  #add parameters
+  
+  for (a in  1:length(alpha)){
+    for (l in 1:length(lambda)){
+        train_err_vec <- list_folds_train[[i]][a, l]
+        test_err_vec <- list_folds_test[[i]][a, l]
+        train_err <- append(train_err, train_err_vec)
+        test_err <-  append(test_err, test_err_vec)
+        #add onew combination of parameters
+        parameters <- append(parameters, param_string(c(alpha[a], lambda[l]), c("alpha", "lambda")))
+      
+      }
+    }
+  fold_vec = rep(c(i), each = length(alpha)*length(lambda)) #the lengh is the number of all parameters permutation
+  fold <- append(fold, fold_vec)
+  }
+#add average results to table 
+for (a in  1:length(alpha)){
+    for (l in 1:length(lambda)){
+      train_err <- append(train_err, matrix_parametrs_train_mean[a,l])
+      test_err <- append(test_err,matrix_parametrs_test_mean[a,l])
+      parameters <- append(parameters, param_string(c(alpha[a], lambda[l]), c("alpha", "lambda")))
+      fold <- append(fold, "average")
+      method <- append(method, "elastic_net")
+    }
+  }
+      
+#add results from reference model
+fold <- append(fold, ref_fold_vec)
+train_err <- append(train_err, ref_train_err_vec)
+test_err <- append(test_err, ref_test_err_vec)
+parameters <- append(parameters, rep(c(NA), each=length(ref_fold_vec)))
+method <- append(method, rep(c("reference_model"), each=length(ref_fold_vec)))
+
+table = data.frame(fold, method, parameters, train_err, test_err)
+table
+```
+W celu wybrania najlepszego modelu porównamy wyniki uśrednione. 
+```{r}
+avr_table <- table[which(table$fold == "average"),]
+avr_table[order(avr_table$test_err),]
+```
+Zapiszemy predykcje dla najlepszego modelu elastic net i random forest.
+```{r}
+#elastic net
+chosen_model_glmnet <- glmnet(x=x_train[train,,drop=TRUE],  y=y_train[train,], alpha =chosen_alpha, lambda = chosen_lambda)
+y_pred_glmnet <- predict(chosen_model_glmnet, newx = as.matrix(x_test))
+y_res_glmnet <- predict(chosen_model_glmnet, newx = as.matrix(x_train))
+RMSD_train_glmnet <-  sqrt(sum((y_res_glmnet- y_train)^2))
+
+
+#random forest
+chosen_model_ranger <- ranger(x=x_train,  y=y_train$CD36, alpha = 0.5, num.trees = 50, max.depth = 500)
+y_pred_random_forest <- predict(chosen_model_ranger, data=x_test)$predictions
+y_res_random_forest <- predict(chosen_model_ranger, data=x_train)$predictions
+RMSD_train_random_forest <-  sqrt(sum((y_res_random_forest- y_train)^2))
+```
+
+```{r echo=FALSE}
+#export to Keggle format
+keggle_table_rf = data.frame(Id = c(0:(length(y_pred_random_forest)-1)), Expected = y_pred_random_forest)
+write.csv(keggle_table_rf, "jg_6.csv", row.names = FALSE)
+```
+
+Biorąc pod uwagę najlepszy możliwy wynik należałoby wskazać elastic net jako lepszy model (dla parametrów `r table[order(table$test_err),][1,3]`), natomiast za pomocą modelu random forest również osiągnięto wynik niewiele gorszy, Dla zadanej siatki hiperparametrów oba modelu są porównywalnie dobre.   
+
+## 4 Budowa modelu 
+
+Ponieważ mamy w danych bezpośrednio poziom rna kodującego białko CD36, to możemy domyślać się, że zmienna ta będzie miała największy wpływ na poziom białka CD36. Poniżej zwizualizowałam zależnoć rna kodującego białko CD36, a poziomem białka CD36.
+Choć trudno mówić to o konkretnym trendzie, to możemy bardzo zgrubnie zobaczyć trend linniowy, który ujwnia się trochę bardziej po transformacji logistycznej danych rna. Ta analiza sugeruję, że warto rozważyć transformacje logistyczną pozostałych zmiennych objaśnaich (które również opisuja poziom danego rna). 
+```{r}
+df = data.frame(rna=x_train$CD36,protein = y_train$CD36) 
+ggplot(df, aes(x=rna, y=protein))+ geom_point() + geom_smooth(method=lm)
+df$rna <- log(df$rna)
+ggplot(df, aes(x=rna, y=protein))+ geom_point() + geom_smooth(method=lm)
+```
+```{r}
+#logistic data transformation
+x_train_log <-apply(x_train, 2, log)
+x_train_log[x_train_log == -Inf] <-0 #replace all -inf values to zero so they can be proceed in training
+```
+
+Ponieważ mamy bardzo dużo zmiennych możemy spróbować użyć regularyzacji lasso i przetestować ją na danych z i bez transformacji logistycznej. 
+
+```{r}
+library(caret)
+lassoGrid <- expand.grid(lambda = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100), alpha = c(1)) #alpha 1 -> lasso
+train_control <- trainControl(method='cv', number=5)
+lasso_kfold_train <- train(x=x_train_log, y=y_train$CD36, method = 'glmnet', trControl=train_control, tuneGrid =lassoGrid)
+res_train <- predict(lasso_kfold_train, newdata = x_train_log)
+x_test_log <-apply(x_test, 2, log)
+x_test_log[x_test_log == -Inf]  <- 0 #to predict test we have to do the same transformation
+res_test <- predict(lasso_kfold_train, newdata = x_test_log)
+RMSD_train_lasso_log <- sqrt(sum((res_train- y_train)^2))
+RMSD_test_lasso_log_mean <- mean(lasso_kfold_train$resample$RMSE)
+```
+```{r, include=FALSE}
+#count RMSD on train set
+#save to csv for keggle
+keggle_table = data.frame(Id = c(0:(length(res_test)-1)), Expected = res_test)
+write.csv(keggle_table, "jg1.csv", row.names = FALSE)
+```
+
+```{r}
+#check how model deal when there is no log transformation
+library(caret)
+lassoGrid <- expand.grid(lambda = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100), alpha = c(1)) #alpha 1 -> lasso
+train_control <- trainControl(method='cv', number=5)
+non_log_lasso_kfold_train <- train(x=x_train, y=y_train$CD36, method = 'glmnet', trControl=train_control, tuneGrid =lassoGrid)
+res_train <- predict(non_log_lasso_kfold_train, newdata = x_train)
+res_test <- predict(non_log_lasso_kfold_train, newdata = x_test)
+#count RMSD on train set
+RMSD_train_lasso <- sqrt(sum((res_train- y_train)^2))
+RMSD_test_lasso_mean <- mean(non_log_lasso_kfold_train$resample$RMSE)
+
+```
+```{r, include=FALSE}
+#save to csv for keggle
+keggle_table = data.frame(Id = c(0:(length(res_test)-1)), Expected = res_test)
+write.csv(keggle_table, "jg_2.csv", row.names = FALSE)
+```
+Biorąc pod uwagę wyniki RMSD dla obu wariantów danych (`r RMSD_test_lasso_log_mean`  dla danych z transformacją logistyczną i `r RMSD_test_lasso_mean` dla danych bez transformacji logistycznej), będę uczyć model na danych bez transformcji logistycznej.
+
+```{r}
+#check the resulted coefficients
+coef_non_log_lasso <- as.matrix(coef(non_log_lasso_kfold_train$finalModel, s = non_log_lasso_kfold_train$bestTune$lambda))
+how_many_coef <- sum(coef_non_log_lasso[,1] !=0)
+```
+Po zastosowaniu lasso w modelu utrzymaliśmy `r how_many_coef` współczynników.   
+Porównajmy z wcześniejszym modelem glmnet.
+```{r}
+# model zbudowany na danych treningowych
+coef_glmnet <- coef(chosen_model_glmnet)
+how_many_coef_glmnet <- sum(coef_glmnet[,1] !=0)  
+```
+Po zastosowaniu lasso w modelu utrzymaliśmy `r how_many_coef_glmnet` współczynników.   
+Spróbujmy zastosować do zadanych danych PCA.
+```{r}
+svd_rna <- svd(x_train)
+V <- svd_rna$v
+Sigma <- svd_rna$d
+U <- svd_rna$u
+```
+```{r, include=FALSE}
+saveRDS(svd_rna, file = "svd_rna.rds") #save svd as object
+readRDS(file = "svd_rna.rds")
+
+```
+```{r}
+cumsum_pca <- cumsum(Sigma^2)/sum(Sigma^2)
+cumsum_pca[1501:1750]
+```
+Możemy zauważyć, że dopiero wzięcie piewszych 1747  składowych pozwoli nam na osiągnięcie wariancji na poziomie 94%. Dlatego spróbujemy innego podejścia.
+
+W celu zbudowania dobrego modelu chcemy się pozbyć wysoko skorelowanych zmiennych. W tym celu potraktujemy korelacje jako odległość między genami, a następnie sklastrujemy je hierarchicznie. W tym celu uwzględnimy tylko 250 o największej i najmniejszej korealcji ze zmienną objaśnianą, czyli takie które są silnie skorelowane pozytywnie lub negatywnie.
+```{r}
+corr_matrix<-cor(x_train)
+#find variables which correlation is above 80% but less then 100% - we dont want include self correlation
+selected <- which(corr_matrix > 0.8 & corr_matrix < 1, arr.ind = T)
+#we want to save only one of each clusters of highly correlated values
+# we have to decrease number of data
+# lets analyse only those with high (positive and negative correlation)
+order_corr <- unlist(order(corr, decreasing=TRUE))[1:250]
+p.corr <- cor(x_train[,order_corr])
+cor.tree <- hclust(as.dist(p.corr))
+plot(cor.tree, cex = 0.00002)
+order_corr_neg <- unlist(order(corr, decreasing=FALSE))[1:250]
+p.corr.neg <- cor(x_train[,order_corr_neg])
+cor.neg.tree <- hclust(as.dist(p.corr.neg))
+plot(cor.tree, cex = 0.00002)
+#cuttrees
+k1 = 25
+clusters.cor <- cutree(cor.tree, k=k1)
+k2 = 30
+clusters.cor.neg <- cutree(cor.neg.tree, k=k2)
+#choose one from each cluster
+clusters.df <- data.frame(gene = names(clusters.cor), cluster = clusters.cor)
+clusters.df.neg <- data.frame(gene = names(clusters.cor.neg), cluster = clusters.cor.neg)
+vec_genes_name <- c()
+for (i in 1:k1){
+  cluster.gene <- clusters.df[which(clusters.df$cluster == i),]$gene[1] #take first
+  vec_genes_name <- append(vec_genes_name, cluster.gene)
+  }
+
+neg_vec_genes_name <- c()
+for (i in 1:k2){
+  cluster.gene <- clusters.df.neg[which(clusters.df.neg$cluster == i),]$gene[1] #take first
+  neg_vec_genes_name <- append(neg_vec_genes_name, cluster.gene)
+}
+#chosen
+vec_genes_name <- append(vec_genes_name, neg_vec_genes_name)
+new_x_train <- x_train[, vec_genes_name] 
+new_x_test <- x_test[, vec_genes_name] 
+```
+Najmniejsza wartość korelacji wśród wybranych zmiennych dla korelacji pozytywnej wynosiła `r p.corr[1:250][250]`, a dla korelacji negatywnej `r p.corr.neg[1:250][250]`.
+Sprawdżmy czy tak wybrane zmienne poprawią wynik dla modelu elastic net lub random forest. 
+
+1. Elastic net
+```{r}
+train_control <- trainControl(method='cv', number=5)
+grid_glmnet <- expand.grid(lambda=lambda, alpha=alpha)
+glm_kfold_train <- train(x=new_x_train, y=y_train$CD36, method = 'glmnet', trControl=train_control, tuneGrid = grid_glmnet)
+glm_res_train <- predict(glm_kfold_train, newdata = new_x_train)
+#calculate glm on x test
+glm_res_test <- predict(glm_kfold_train, newdata = new_x_test)
+#count RMSD on train set
+RMSD_train_glm <- sqrt(sum((glm_res_train- y_train)^2))
+RMSD_test_glm_mean <- mean(lasso_kfold_train$resample$RMSE)
+
+```
+Porównując wynik dla elastic net dla okrojonych danych `r RMSD_test_glm_mean` wynikiem dla orginalnych danych `r sort(avr_table[which(avr_table$method == 'elastic_net'),'test_err'])[1]`, możemy stwierdzić, że selekcja danych pogorszyła wynik treningu.
+
+2. Random forest
+```{r}
+train_control <- trainControl(method='cv', number=5)
+grid_rf <- expand.grid(mtry= c(1, 2, 3, 4, 5, 7, 8, 10, 15, 50), splitrule = c("extratrees"), min.node.size = c(1, 2, 3, 4, 5,10))
+rf_selected_kfold_train <- train(x=new_x_train, y=y_train$CD36, method = 'ranger', trControl=train_control, tuneGrid = grid_rf)
+glm_res_train <- predict(glm_kfold_train, newdata = new_x_train)
+#calculate PCA on x test
+rf_res_test <- predict(glm_kfold_train, newdata = new_x_test)
+RMSD_train_rf <- sqrt(sum((glm_res_train- y_train)^2))
+RMSD_test_rf_selected_mean <- mean(rf_selected_kfold_train$resample$RMSE)
+
+```
+Porównując wynik dla random forest dla okrojonych danych `r RMSD_test_rf_selected_mean` wynikiem dla orginalnych danych `r sort(avr_table[which(avr_table$method == 'random_forest'),'test_err'])[1]`, możemy stwierdzić, że selekcja danych pogorszyła  wynik treningu. Ostatecznie wybieram random forest bez selecji danych jako to najlepszy model. 
+
+```{r echo=FALSE}
+#export to Keggle format
+keggle_table_pcr = data.frame(Id = c(0:(length(rf_res_test)-1)), Expected = rf_res_test)
+write.csv(keggle_table_pcr, "jg_5.csv", row.names = FALSE)
+```
